@@ -5,13 +5,20 @@ set -euo pipefail
 
 # Show the command syntax or report a clear input error.
 usage() {
-  printf 'Usage: %s <source-directory> [output.pkg]\n' "${0##*/}" >&2
+  printf 'Usage: %s [--scripts] <source-directory> [output.pkg]\n' "${0##*/}" >&2
 }
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
+
+# Package files are the default; --scripts switches to shell-script mode.
+item_mode=packages
+if [[ ${1-} == --scripts ]]; then
+  item_mode=scripts
+  shift
+fi
 
 # Accept a source folder and an optional output package path.
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -57,23 +64,31 @@ if [[ "$output_path" == "$source_dir" || "$output_path" == "$source_dir/"* ]]; t
   fail "Output package must be outside the source directory."
 fi
 
-# Find regular .pkg files recursively; NUL separators safely handle unusual names.
-packages=()
-while IFS= read -r -d '' package; do
-  packages+=("$package")
-done < <(find "$source_dir" -type f -name '*.pkg' -print0)
+# Find the selected items recursively; NUL separators safely handle unusual names.
+items=()
+if [[ "$item_mode" == scripts ]]; then
+  while IFS= read -r -d '' item; do
+    items+=("$item")
+  done < <(find "$source_dir" -type f \( -name '*.sh' -o -name '*.zsh' \) -print0)
+  item_description="shell scripts (.sh and .zsh)"
+else
+  while IFS= read -r -d '' item; do
+    items+=("$item")
+  done < <(find "$source_dir" -type f -name '*.pkg' -print0)
+  item_description=".pkg files"
+fi
 
-[[ ${#packages[@]} -gt 0 ]] || fail "No .pkg files found in: $source_dir"
+[[ ${#items[@]} -gt 0 ]] || fail "No $item_description found in: $source_dir"
 
-# Sort paths alphabetically so every wrapper installs packages in a predictable order.
-for ((i = 1; i < ${#packages[@]}; i++)); do
-  current=${packages[i]}
+# Sort paths alphabetically so every wrapper processes items predictably.
+for ((i = 1; i < ${#items[@]}; i++)); do
+  current=${items[i]}
   j=$((i - 1))
-  while ((j >= 0)) && [[ "$current" < "${packages[j]}" ]]; do
-    packages[j + 1]=${packages[j]}
+  while ((j >= 0)) && [[ "$current" < "${items[j]}" ]]; do
+    items[j + 1]=${items[j]}
     j=$((j - 1))
   done
-  packages[j + 1]=$current
+  items[j + 1]=$current
 done
 
 # Build in a temporary workspace and remove it whether the build succeeds or fails.
@@ -84,14 +99,14 @@ trap 'rm -rf "$work_dir"' EXIT
 # ditto preserves the source tree structure and macOS file metadata.
 package_base="$work_dir/payload/Library/Application Support/PKGPrepTool/$package_identifier"
 source_stage="$package_base/source"
-package_manifest="$package_base/packages.list"
+item_manifest="$package_base/items.list"
 mkdir -p "$package_base" "$work_dir/scripts"
 ditto "$source_dir" "$source_stage"
 
-# Record sorted package paths relative to the source root using NUL separators.
+# Record sorted item paths relative to the source root using NUL separators.
 # The manifest stays outside the copied source tree so its contents remain unchanged.
-for package in "${packages[@]}"; do
-  printf '%s\0' "${package#"$source_dir"/}" >> "$package_manifest"
+for item in "${items[@]}"; do
+  printf '%s\0' "${item#"$source_dir"/}" >> "$item_manifest"
 done
 
 # This script runs after the wrapper's payload is installed. It installs each staged
@@ -104,7 +119,8 @@ set -u
 # The builder replaces this token with the wrapper's package identifier.
 payload_root="/Library/Application Support/PKGPrepTool/@PACKAGE_IDENTIFIER@"
 source_dir="$payload_root/source"
-package_manifest="$payload_root/packages.list"
+item_manifest="$payload_root/items.list"
+item_mode="@ITEM_MODE@"
 log_dir="/Library/Application Support/PKGPrepTool"
 failures=0
 
@@ -130,43 +146,64 @@ printf 'Started at %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Log file: %s\n' "$log_file"
 
 # A missing source tree or manifest means the wrapper payload is incomplete.
-if [[ ! -d "$source_dir" || ! -f "$package_manifest" ]]; then
+if [[ ! -d "$source_dir" || ! -f "$item_manifest" ]]; then
   printf 'Error: embedded source tree or package manifest is missing.\n' >&2
   exit 1
 fi
 
-# Install packages in the sorted order recorded by the builder. Run Installer from
-# each package's containing folder so adjacent source files remain available.
-while IFS= read -r -d '' relative_package; do
-  package="$source_dir/$relative_package"
-  if [[ ! -f "$package" ]]; then
-    printf 'Error: embedded package is missing: %s\n' "$relative_package" >&2
+# Process items in the sorted order recorded by the builder. Run each from its
+# containing folder so companion files remain available through relative paths.
+while IFS= read -r -d '' relative_item; do
+  item="$source_dir/$relative_item"
+  if [[ ! -f "$item" ]]; then
+    printf 'Error: embedded item is missing: %s\n' "$relative_item" >&2
     failures=$((failures + 1))
     continue
   fi
-  printf 'Installing %s\n' "$relative_package"
-  if (cd "${package%/*}" && /usr/sbin/installer -pkg "$package" -target /); then
+  printf 'Processing %s\n' "$relative_item"
+  if [[ "$item_mode" == scripts ]]; then
+    case "${item##*.}" in
+      sh) interpreter=/bin/bash ;;
+      zsh) interpreter=/bin/zsh ;;
+      *)
+        printf 'Error: unsupported script type: %s\n' "$relative_item" >&2
+        failures=$((failures + 1))
+        continue
+        ;;
+    esac
+    if (cd "${item%/*}" && "$interpreter" "$item"); then
+      :
+    else
+      printf 'Error: failed to run %s\n' "$relative_item" >&2
+      failures=$((failures + 1))
+    fi
+  elif (cd "${item%/*}" && /usr/sbin/installer -pkg "$item" -target /); then
     :
   else
-    printf 'Error: failed to install %s\n' "$relative_package" >&2
+    printf 'Error: failed to install %s\n' "$relative_item" >&2
     failures=$((failures + 1))
   fi
-done < "$package_manifest"
+done < "$item_manifest"
 
 printf 'Finished at %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')"
 
-# Return a failure status to Installer if any nested package could not be installed.
+# Return a failure status to Installer if any item failed.
 if ((failures > 0)); then
-  printf 'Error: %d embedded package(s) failed to install.\n' "$failures" >&2
+  printf 'Error: %d embedded item(s) failed.\n' "$failures" >&2
   exit 1
 fi
 
-printf 'All embedded packages installed successfully.\n'
+if [[ "$item_mode" == scripts ]]; then
+  printf 'All embedded scripts ran successfully.\n'
+else
+  printf 'All embedded packages installed successfully.\n'
+fi
 exit 0
 POSTINSTALL
 
-# Fill in the package-specific payload path and mark the script executable for Installer.
-sed "s/@PACKAGE_IDENTIFIER@/$package_identifier/g" \
+# Fill in package-specific values and mark the script executable for Installer.
+sed -e "s/@PACKAGE_IDENTIFIER@/$package_identifier/g" \
+  -e "s/@ITEM_MODE@/$item_mode/g" \
   "$work_dir/scripts/postinstall" > "$work_dir/scripts/postinstall.tmp"
 mv "$work_dir/scripts/postinstall.tmp" "$work_dir/scripts/postinstall"
 chmod 755 "$work_dir/scripts/postinstall"
@@ -182,4 +219,4 @@ pkgbuild \
 
 # Report where the wrapper was written and how many packages it contains.
 printf 'Created package: %s\n' "$output_path"
-printf 'Embedded packages: %d (alphabetical by source path)\n' "${#packages[@]}"
+printf 'Embedded %s: %d (alphabetical by source path)\n' "$item_description" "${#items[@]}"
